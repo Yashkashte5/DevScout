@@ -1,152 +1,143 @@
-import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import json
-from google.adk.agents import Agent
-from google.adk.tools import FunctionTool
+from groq import Groq
+
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+EXPLANATION_MODEL = "llama-3.1-8b-instant"
 
 
-async def format_for_explanation(ranked_json: str, intent_json: str) -> dict:
-    """
-    Prepare ranked results for explanation generation.
-    
-    Args:
-        ranked_json: JSON string of ranked results from ranking agent
-        intent_json: JSON string of user intent from coordinator
-    
-    Returns:
-        Structured data ready for explanation
-    """
-    try:
-        ranked = json.loads(ranked_json)
-        intent = json.loads(intent_json)
-    except json.JSONDecodeError as e:
-        return {"error": f"Invalid JSON: {str(e)}"}
+def build_explanation_prompt(trimmed_results: list, intent: dict) -> str:
+    """Build a compact prompt for explanation generation."""
+    results_text = ""
+    for item in trimmed_results:
+        results_text += f"""
+Rank {item.get('rank')}: {item.get('name')} ({item.get('type')})
+- Score: {item.get('score')}
+- Stars: {item.get('stars')} | Forks: {item.get('forks')}
+- Last commit: {item.get('last_commit_days')} days ago
+- Description: {item.get('description', '')[:100]}
+- URL: {item.get('url')}
+"""
 
-    top_results = ranked.get("ranked", [])[:3]
-    
-    prepared = []
-    for i, result in enumerate(top_results):
-        data = result.get("data", {})
-        prepared.append({
-            "rank": i + 1,
-            "type": result.get("type"),
-            "name": data.get("name"),
-            "score": result.get("score"),
-            "stars": data.get("stars"),
-            "description": data.get("description"),
-            "last_commit_days": data.get("last_commit_days"),
-            "release_days": data.get("release_days"),
-            "url": data.get("url") or data.get("package_url"),
-            "topics": data.get("topics", []),
-            "forks": data.get("forks"),
-            "latest_version": data.get("latest_version")
-        })
+    return f"""You are a developer advisor. Explain these ranked results for the query: "{intent.get('original_query')}".
 
-    return {
-        "top_results": prepared,
-        "user_intent": intent,
-        "query": intent.get("original_query", "")
-    }
+Results:
+{results_text}
 
-
-async def format_comparison(item_one: str, item_two: str) -> dict:
-    """
-    Prepare two items for head-to-head comparison.
-    
-    Args:
-        item_one: JSON string of first item
-        item_two: JSON string of second item
-    
-    Returns:
-        Structured comparison data
-    """
-    try:
-        one = json.loads(item_one)
-        two = json.loads(item_two)
-    except json.JSONDecodeError as e:
-        return {"error": f"Invalid JSON: {str(e)}"}
-
-    return {
-        "item_one": one,
-        "item_two": two,
-        "comparison_signals": {
-            "stars": {
-                "item_one": one.get("data", {}).get("stars", 0),
-                "item_two": two.get("data", {}).get("stars", 0)
-            },
-            "commit_recency_days": {
-                "item_one": one.get("data", {}).get("last_commit_days"),
-                "item_two": two.get("data", {}).get("last_commit_days")
-            },
-            "score": {
-                "item_one": one.get("score"),
-                "item_two": two.get("score")
-            }
-        }
-    }
-
-
-format_tool = FunctionTool(func=format_for_explanation)
-comparison_tool = FunctionTool(func=format_comparison)
-
-
-explanation_agent = Agent(
-    name="explanation_agent",
-    model="gemini-2.0-flash",
-    description="Converts ranked results into clear, human-readable recommendations with tradeoff analysis.",
-    instruction="""
-You are an expert developer advisor. Your job is to explain recommendations clearly and honestly.
-
-For standard recommendations:
-1. Call format_for_explanation with the ranked data and intent
-2. Write a concise recommendation for each of the top 3 results
-3. Explain WHY it ranked where it did — cite actual data (stars, commit recency, etc.)
-4. Highlight tradeoffs honestly — mention weaknesses, not just strengths
-5. End with a "Best for" summary for each result
-
-For comparison requests:
-1. Call format_comparison with the two items
-2. Compare them across: maturity, activity, complexity, community size
-3. Give a clear recommendation based on the user's stated need
-4. Never be vague — always say which one wins for which use case
-
-Output format for recommendations:
-{
+Return ONLY valid JSON in this exact format:
+{{
   "recommendations": [
-    {
+    {{
       "rank": 1,
       "name": "...",
       "type": "repo or package",
       "url": "...",
-      "summary": "2-3 sentence explanation",
-      "strengths": ["...", "..."],
-      "weaknesses": ["...", "..."],
-      "best_for": "...",
+      "summary": "2 sentence explanation citing actual data",
+      "strengths": ["strength 1", "strength 2"],
+      "weaknesses": ["weakness 1"],
+      "best_for": "who should use this",
       "score": 0.0
-    }
+    }}
   ],
-  "overall_insight": "1-2 sentence summary of the landscape",
+  "overall_insight": "1 sentence landscape summary",
   "mode": "recommendations"
-}
+}}
 
-Output format for comparisons:
-{
-  "comparison": {
-    "item_one": { "name": "...", "verdict": "..." },
-    "item_two": { "name": "...", "verdict": "..." },
-    "winner_for": {
-      "beginners": "...",
-      "production": "...",
-      "simplicity": "..."
-    },
-    "final_recommendation": "..."
-  },
+Include all {len(trimmed_results)} results. No markdown, no backticks, valid JSON only."""
+
+
+def build_comparison_prompt(item_one: dict, item_two: dict, query: str) -> str:
+    """Build a compact prompt for comparison."""
+    return f"""Compare these two developer resources for: "{query}"
+
+Item 1: {item_one.get('name')}
+- Stars: {item_one.get('stars')} | Last commit: {item_one.get('last_commit_days')} days ago
+- Description: {item_one.get('description', '')[:80]}
+
+Item 2: {item_two.get('name')}
+- Stars: {item_two.get('stars')} | Last commit: {item_two.get('last_commit_days')} days ago
+- Description: {item_two.get('description', '')[:80]}
+
+Return ONLY valid JSON:
+{{
+  "comparison": {{
+    "item_one": {{"name": "...", "verdict": "2 sentence verdict"}},
+    "item_two": {{"name": "...", "verdict": "2 sentence verdict"}},
+    "winner_for": {{
+      "beginners": "name",
+      "production": "name",
+      "simplicity": "name"
+    }},
+    "final_recommendation": "1 sentence clear recommendation"
+  }},
   "mode": "comparison"
-}
+}}
 
-Always be specific. Never say "it depends" without explaining what it depends on.
-""",
-    tools=[format_tool, comparison_tool]
-)
+No markdown, no backticks, valid JSON only."""
+
+
+async def explain_results(trimmed_results: list, intent: dict) -> dict:
+    """Generate explanations via direct Groq call — no ADK, no tools."""
+    import re
+
+    prompt = build_explanation_prompt(trimmed_results, intent)
+
+    response = groq_client.chat.completions.create(
+        model=EXPLANATION_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a developer advisor. Always return valid JSON only. No markdown, no backticks."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"}
+    )
+
+    raw = response.choices[0].message.content.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        return {"raw_text": raw}
+
+
+async def explain_comparison(item_one: dict, item_two: dict, query: str) -> dict:
+    """Generate comparison via direct Groq call."""
+    import re
+
+    prompt = build_comparison_prompt(item_one, item_two, query)
+
+    response = groq_client.chat.completions.create(
+        model=EXPLANATION_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a developer advisor. Always return valid JSON only. No markdown, no backticks."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"}
+    )
+
+    raw = response.choices[0].message.content.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        return {"raw_text": raw}
